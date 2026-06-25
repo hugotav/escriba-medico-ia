@@ -1,4 +1,5 @@
 import os
+import streamlit as st
 from groq import Groq
 
 CHAVE_API = st.secrets["GROQ_API_KEY"]
