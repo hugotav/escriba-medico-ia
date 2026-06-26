@@ -3,3 +3,4 @@ __pycache__/
 *.webm
 *.mp3
 *.wav
+.streamlit/
