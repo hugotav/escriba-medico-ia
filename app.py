@@ -12,7 +12,7 @@ st.set_page_config(
 )
 
 st.title("📋 Prontuário Inteligente")
-st.markdown("Grave a consulta em tempo real ou envie um arquivo de áudio para gerar o prontuário SOAP instantaneamente.")
+st.markdown("Grave a consulta em tempo real ou envie um arquivo de áudio para gerar o prontuário instantaneamente.")
 
 st.divider()
 
@@ -32,7 +32,7 @@ def processar_audio_e_gerar_relatorio(caminho_arquivo):
             texto_transcrito = transcrever_audio(caminho_arquivo)
         
         if texto_transcrito.strip() and not texto_transcrito.startswith("⚠️"):
-            with st.spinner("📝 Analisando o contexto clínico e estruturando o SOAP..."):
+            with st.spinner("📝 Analisando o contexto clínico e estruturando o relatório..."):
                 resultado_soap = estruturar_consulta_soap(texto_transcrito)
                 
                 # Atualiza a memória global (que agora atualiza a caixa de texto automaticamente)
@@ -102,7 +102,7 @@ with aba_upload:
 # 📋 ZONA DE EXIBIÇÃO DO RESULTADO (Mantida igual)
 if st.session_state.relatorio_soap:
     st.divider()
-    st.subheader("📋 Prontuário SOAP Final (Editável)")
+    st.subheader("📋 Prontuário Final (Editável)")
     st.markdown("_Clique dentro da caixa de texto para fazer os ajustes necessários antes de colar no sistema da clínica._")
     
     st.text_area(
