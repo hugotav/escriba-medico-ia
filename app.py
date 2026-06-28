@@ -4,6 +4,10 @@ from streamlit_mic_recorder import mic_recorder
 from transcritor import transcrever_audio
 from estruturador import estruturar_consulta_soap
 
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
 # Configuração da página profissional
 st.set_page_config(
     page_title="Prontuário IA", 
@@ -99,10 +103,10 @@ with aba_upload:
                 
             processar_audio_e_gerar_relatorio(caminho_temp_upload)
 
-# 📋 ZONA DE EXIBIÇÃO DO RESULTADO (Mantida igual)
+# 📋 ZONA DE EXIBIÇÃO DO RESULTADO
 if st.session_state.relatorio_soap:
     st.divider()
-    st.subheader("📋 Prontuário Final (Editável)")
+    st.subheader("📋 Prontuário de Admissão Final (Editável)")
     st.markdown("_Clique dentro da caixa de texto para fazer os ajustes necessários antes de colar no sistema da clínica._")
     
     st.text_area(
@@ -112,3 +116,50 @@ if st.session_state.relatorio_soap:
     )
     
     st.info("💡 **Dica de Produtividade:** Clique na caixa acima, aperte `Ctrl + A` para selecionar tudo e `Ctrl + C` para copiar.")
+    
+    # --- NOVA SEÇÃO: ENVIO POR E-MAIL ---
+    st.divider()
+    st.markdown("### 📧 Enviar Prontuário por E-mail")
+    
+    # Cria duas colunas: uma maior para o texto, uma menor para o botão
+    col_email, col_botao = st.columns([3, 1])
+    
+    with col_email:
+        email_destino = st.text_input(
+            "E-mail do médico:", 
+            placeholder="digite.o.email@exemplo.com", 
+            label_visibility="collapsed"
+        )
+        
+    with col_botao:
+        enviar_email = st.button("🚀 Enviar", use_container_width=True)
+        
+    if enviar_email:
+        if email_destino:
+            try:
+                # Configuração do e-mail (usando Gmail como exemplo)
+                remetente = st.secrets["EMAIL_USER"]
+                senha_app = st.secrets["EMAIL_PASSWORD"]
+                
+                # Montando a mensagem
+                msg = MIMEMultipart()
+                msg['From'] = remetente
+                msg['To'] = email_destino
+                msg['Subject'] = "Prontuário de Admissão - Escriba Médico IA"
+                
+                # O corpo do e-mail é o texto que está na text_area
+                corpo_email = st.session_state.relatorio_soap
+                msg.attach(MIMEText(corpo_email, 'plain'))
+                
+                # Conectando ao servidor do Yahoo e enviando
+                server = smtplib.SMTP('smtp.mail.yahoo.com', 587)
+                server.starttls()
+                server.login(remetente, senha_app)
+                server.send_message(msg)
+                server.quit()
+                
+                st.success(f"✅ Prontuário enviado com sucesso para {email_destino}!")
+            except Exception as e:
+                st.error(f"❌ Erro ao enviar e-mail. Verifique as configurações. Detalhes: {e}")
+        else:
+            st.warning("⚠️ Por favor, informe um endereço de e-mail válido antes de enviar.")
