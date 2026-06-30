@@ -1,0 +1,32 @@
+cookie:
+  expiry_days: 30
+  key: sd8f76s8df76s8df7sdf
+  name: cookie_login_escriba
+credentials:
+  usernames:
+    hugo.neto:
+      email: hugotavaresneto@gmail.com
+      failed_login_attempts: 0
+      logged_in: false
+      name: Hugo M T Neto
+      password: $2b$12$cwyzlMUylnDuLaHEq9pB8e5d2s9b4GqIF4PSPmsfbnB8ZMfNB/H4y
+      roles:
+      - admin
+    marcela.alves:
+      email: marcelacalves95@gmail.com
+      failed_login_attempts: 0
+      logged_in: false
+      name: Marcela C Alves
+      password: $2b$12$IjKt.DLD0wgYWzXKKa02/eqQoFeELsiI7nLw/TjFT8DRHpGondCnW
+      roles:
+      - medico
+    medico.teste:
+      email: medicoteste@gmail.com
+      failed_login_attempts: 0
+      logged_in: false
+      name: "M\xE9dico Teste"
+      password: $2b$12$cgniYa05C/5ojE0XmYSTVO355/7iHQZCiYO23CJ1LIEaCSTHg/luq
+      roles:
+      - medico
+pre-authorized:
+  emails: null

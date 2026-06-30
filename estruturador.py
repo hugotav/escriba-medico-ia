@@ -81,3 +81,38 @@ def estruturar_consulta_soap(texto_transcrito):
         
     except Exception as e:
         return f"Erro na estruturação da Groq: {e}"
+    
+def estruturar_evolucao(texto_transcrito):
+    """
+    Recebe o texto bruto da transcrição e estrutura no formato de Evolução Clínica.
+    """
+    if not client.api_key:
+        return "⚠️ Erro: Você esqueceu de colocar sua chave da API Groq no topo do arquivo estruturador.py!"
+
+    prompt_sistema_evolucao = (
+        "Você é um Escriba Médico especialista em Evoluções Hospitalares e Clínicas.\n"
+        "O objetivo é gerar uma nota de evolução concisa, precisa e direta ao ponto a partir do áudio gravado pelo médico.\n\n"
+        "Estruture a resposta estritamente no seguinte padrão:\n\n"
+        "### EVOLUÇÃO DIÁRIA\n"
+        "- **Subjetivo:** (Como o paciente passou, queixas, aceitação da dieta, sono).\n"
+        "- **Objetivo:** (Exame físico focado e dados vitais mencionados).\n"
+        "- **Avaliação:** (Impressão do médico sobre a evolução do quadro - melhora, piora ou estável).\n"
+        "- **Plano/Conduta:** (Ajustes terapêuticos, exames solicitados e próximos passos).\n"
+        "- **Pendências:** (Caso o médico mencione algo que precisa ser checado depois).\n\n"
+        "Aja com linguagem técnica médica, seja objetivo e remova qualquer conversa fiada."
+    )
+
+    try:
+        resposta = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",  # Mantemos o mesmo modelo de alta performance
+            messages=[
+                {"role": "system", "content": prompt_sistema_evolucao},
+                {"role": "user", "content": f"Aqui está a transcrição bruta da evolução:\n\n{texto_transcrito}"}
+            ],
+            temperature=0.1,  # Temperatura baixa para precisão clínica
+            stream=False
+        )
+        return resposta.choices[0].message.content
+        
+    except Exception as e:
+        return f"Erro na estruturação da Groq (Evolução): {e}"
