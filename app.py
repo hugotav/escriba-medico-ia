@@ -95,9 +95,6 @@ elif st.session_state["authentication_status"]:
             st.session_state.ultimo_audio_id = None
             st.session_state.modo_anterior = modo_medico # Atualiza para a nova aba
 
-    # ==========================================
-    # TELA 1: GESTÃO DE USUÁRIOS (SÓ ADMIN)
-    # ==========================================
     if tela_atual == "Gestão de Usuários":
         st.title("👥 Gestão de Usuários")
         st.markdown("Cadastre novos médicos ou gerencie os acessos ativos.")
@@ -195,9 +192,6 @@ elif st.session_state["authentication_status"]:
                             st.success(f"✅ Usuário '{edit_nome}' atualizado com sucesso!")
                             st.rerun()
 
-    # ==========================================
-    # TELA 2: SISTEMA MÉDICO 
-    # ==========================================
     elif tela_atual == "Sistema Médico":
         
         st.title(modo_medico) 
