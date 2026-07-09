@@ -1,4 +1,6 @@
 streamlit
-groq
-streamlit-mic-recorder
+bcrypt
 streamlit-authenticator
+streamlit-mic-recorder
+psycopg2-binary
+pandas
