@@ -1,281 +1,438 @@
 import streamlit as st
 import os
-import yaml
-from yaml.loader import SafeLoader
-import streamlit_authenticator as stauth
 import bcrypt
+import streamlit_authenticator as stauth
 from streamlit_mic_recorder import mic_recorder
-from transcritor import transcrever_audio
-from estruturador import estruturar_consulta_soap, estruturar_evolucao
-
+import uuid
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-
-import csv
-from datetime import datetime
-
-def registrar_log_uso(usuario, tipo):
-    with open('logs_uso.csv', 'a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), usuario, tipo])
-
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import pandas as pd
+from datetime import datetime
+import time
+
+# ==========================================
+# ⚙️ CONFIGURAÇÕES DA PÁGINA
+# ==========================================
+st.set_page_config(page_title="VoxReport IA", page_icon="📋", layout="centered")
+
+def obter_conexao():
+    # Abre uma conexão super rápida. Autocommit evita locks no banco de dados.
+    conn = psycopg2.connect(st.secrets["DB_URI"])
+    conn.autocommit = True
+    return conn
+
+# ==========================================
+# 🚀 FUNÇÕES DE BANCO DE DADOS (COM CACHE ULTRA-RÁPIDO)
+# ==========================================
+@st.cache_data(ttl=300, show_spinner=False)
+def carregar_usuarios_do_banco():
+    conn = None
+    cur = None
+    try:
+        conn = obter_conexao()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        # Traz os usuários e assume que quem não tem a coluna "ativo" é porque está ativo
+        cur.execute("SELECT username, name, email, password, role, COALESCE(ativo, TRUE) as ativo FROM usuarios")
+        usuarios_db = cur.fetchall()
+        
+        credentials = {"usernames": {}}
+        for u in usuarios_db:
+            if u['ativo']: # Só carrega para o login se estiver ativo
+                credentials["usernames"][u['username']] = {
+                    "name": u['name'],
+                    "password": u['password'],
+                    "email": u['email'],
+                    "role": u['role']
+                }
+        return credentials, usuarios_db
+    except Exception as e:
+        return None, None
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
+
+@st.cache_data(ttl=300, show_spinner=False)
+def carregar_metricas():
+    conn = None
+    cur = None
+    try:
+        conn = obter_conexao()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT data, usuario, tipo FROM logs_uso ORDER BY data DESC")
+        registros = cur.fetchall()
+        return registros
+    except:
+        return []
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
+
+@st.cache_data(ttl=300, show_spinner=False)
+def carregar_historico_pessoal(usuario):
+    conn = None
+    cur = None
+    try:
+        conn = obter_conexao()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT data, tipo, conteudo FROM historico_relatorios WHERE usuario = %s ORDER BY data DESC LIMIT 50", (usuario,))
+        registros = cur.fetchall()
+        return registros
+    except:
+        return []
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
 
 def registrar_log_uso(usuario, tipo):
-    with open('logs_uso.csv', 'a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        # Formato: Data, Usuário, Tipo (Admissão ou Evolução)
-        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), usuario, tipo])
+    try:
+        conn = obter_conexao()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO logs_uso (usuario, tipo) VALUES (%s, %s)", (usuario, tipo))
+        cur.close()
+        conn.close()
+        carregar_metricas.clear() # 💡 Limpa o cache para a aba de métricas atualizar na hora
+    except Exception:
+        pass 
 
-# Configuração da página (apenas uma vez)
-st.set_page_config(page_title="Escriba Médico IA", page_icon="📋", layout="centered")
+def salvar_historico_db(usuario, tipo, conteudo):
+    try:
+        conn = obter_conexao()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO historico_relatorios (usuario, tipo, conteudo) VALUES (%s, %s, %s)",
+            (usuario, tipo, conteudo)
+        )
+        cur.close()
+        conn.close()
+        carregar_historico_pessoal.clear() # 💡 Limpa o cache para o histórico atualizar na hora
+    except Exception as e:
+        st.error(f"⚠️ Erro ao guardar no histórico permanente: {e}")
 
-# --- SISTEMA DE LOGIN ---
-with open('config.yaml') as file:
-    config = yaml.load(file, Loader=SafeLoader)
+# ==========================================
+# 🔐 SISTEMA DE LOGIN (À PROVA DE FALHAS)
+# ==========================================
+dados_banco = carregar_usuarios_do_banco()
+
+if dados_banco[0] is None:
+    st.warning("⚠️ Instabilidade temporária com a base de dados. A reconectar...")
+    time.sleep(2)
+    st.rerun()
+
+credentials, lista_usuarios_db = dados_banco
 
 authenticator = stauth.Authenticate(
-    config['credentials'],
-    config['cookie']['name'],
-    config['cookie']['key'],
-    config['cookie']['expiry_days']
+    credentials,
+    "escriba_medico_cookie",
+    "chave_secreta_segura",
+    cookie_expiry_days=30
 )
 
-authenticator.login()
+if not st.session_state.get("authentication_status"):
+    st.title("📋 VoxReport IA")
 
-# Verifica o status da autenticação
-if st.session_state["authentication_status"] is False:
-    st.error('❌ Usuário ou senha incorretos')
-elif st.session_state["authentication_status"] is None:
-    st.warning('🔒 Por favor, insira seu usuário e senha para acessar o sistema.')
-elif st.session_state["authentication_status"]:
-    
-    # === 🛡️ BLINDAGEM DE PRIVACIDADE (TROCA DE USUÁRIO) ===
-    if "usuario_ativo" not in st.session_state or st.session_state["usuario_ativo"] != st.session_state["username"]:
-        st.session_state.relatorio_soap = ""
-        st.session_state.ultimo_audio_id = None
-        st.session_state.usuario_ativo = st.session_state["username"]
-        st.session_state.modo_anterior = None # Reseta também a aba ao trocar de usuário
-    
-    # === TUDO AQUI DENTRO SÓ APARECE PARA QUEM ESTÁ LOGADO ===    
-    authenticator.logout("Sair do Sistema", "sidebar")
-    st.sidebar.write(f'Bem-vindo(a), *{st.session_state["name"]}*')
+authenticator.login(location="main")
 
-    # Variáveis e Permissões do usuário logado
-    username = st.session_state.get("username")
-    is_admin = username and 'admin' in config['credentials']['usernames'].get(username, {}).get('roles', [])
-    
-    # ==========================================
-    # 🎛️ NAVEGAÇÃO LATERAL (SIDEBAR)
-    # ==========================================
+if st.session_state.get("authentication_status") is False:
+    st.error('❌ Utilizador inativo ou palavra-passe incorreta')
+    st.stop()
+elif st.session_state.get("authentication_status") is None:
+    st.warning('Por favor, insira as suas credenciais.')
+    st.stop()
+
+# ==========================================
+# 🚀 ÁREA AUTENTICADA (SISTEMA PRINCIPAL)
+# ==========================================
+username = st.session_state["username"]
+name = st.session_state["name"]
+
+dados_usuario = credentials["usernames"][username]
+is_admin = dados_usuario["role"] == "admin"
+email_usuario = dados_usuario["email"]
+
+authenticator.logout(button_name="Sair do Sistema", location="sidebar")
+st.sidebar.write(f'Bem-vindo(a), *{name}*')
+
+for chave in ["relatorio_soap", "ultimo_audio_id", "ultimo_comp_id", "modo_anterior", "usuario_ativo", "chave_texto", "radio_acao"]:
+    if chave not in st.session_state:
+        if chave == "relatorio_soap":
+            st.session_state[chave] = ""
+        elif chave == "chave_texto":
+            st.session_state[chave] = str(uuid.uuid4())
+        elif chave == "radio_acao":
+            st.session_state[chave] = "📋 Admissão"
+        else:
+            st.session_state[chave] = None
+        
+if st.session_state["usuario_ativo"] != username:
+    st.session_state.relatorio_soap = ""
+    st.session_state.chave_texto = str(uuid.uuid4())
+    st.session_state.ultimo_audio_id = None
+    st.session_state.ultimo_comp_id = None
+    st.session_state.usuario_ativo = username
+    st.session_state.modo_anterior = None 
+
+st.sidebar.divider()
+st.sidebar.markdown("### Navegação")
+
+tela_atual = "Sistema Médico"
+if is_admin:
+    tela_atual = st.sidebar.radio("Área do Sistema:", ["Sistema Médico", "Gestão de Utilizadores", "Métricas"])
     st.sidebar.divider()
-    st.sidebar.markdown("### Navegação")
     
-    tela_atual = "Sistema Médico"
+modo_medico = "Admissão"
+if tela_atual == "Sistema Médico":
+    modo_medico = st.sidebar.radio("Menu:", ["📋 Admissão", "📈 Evolução", "📂 Histórico"], key="radio_acao")
     
-    # Se for admin, pode escolher entre o sistema e a gestão
-    if is_admin:
-        tela_atual = st.sidebar.radio("Área do Sistema:", ["Sistema Médico", "Gestão de Usuários", "📊 Métricas"])
-        st.sidebar.divider()
-        
-    # Se estiver no modo Médico, escolhe o documento
-    modo_medico = "Admissão"
-    if tela_atual == "Sistema Médico":
-        modo_medico = st.sidebar.radio("Tipo de Documento:", ["📋 Admissão", "📈 Evolução"])
-        
-        # === 🧹 RASTREADOR DE ABAS (LIMPEZA DE TELA) ===
-        # Registra qual era a aba na primeira vez
-        if "modo_anterior" not in st.session_state:
-            st.session_state.modo_anterior = modo_medico
-            
-        # Se o médico clicou em uma aba diferente da anterior, limpa o relatório
-        if st.session_state.modo_anterior != modo_medico:
+    if st.session_state.modo_anterior != modo_medico:
+        if modo_medico in ["📋 Admissão", "📈 Evolução"] and st.session_state.modo_anterior in ["📋 Admissão", "📈 Evolução"]:
             st.session_state.relatorio_soap = ""
+            st.session_state.chave_texto = str(uuid.uuid4())
             st.session_state.ultimo_audio_id = None
-            st.session_state.modo_anterior = modo_medico # Atualiza para a nova aba
+            st.session_state.ultimo_comp_id = None
+        st.session_state.modo_anterior = modo_medico 
 
-    if tela_atual == "Gestão de Usuários":
-        st.title("👥 Gestão de Usuários")
-        st.markdown("Cadastre novos médicos ou gerencie os acessos ativos.")
-        
-        st.subheader("Usuários Ativos")
-        for usr, dados in config['credentials']['usernames'].items():
-            perfil = "Administrador" if "admin" in dados.get('roles', []) else "Médico"
-            st.markdown(f"- **{dados['name']}** (`{usr}`) | E-mail: {dados['email']} | Nível: {perfil}")
+# ==========================================
+# TELA: GESTÃO DE UTILIZADORES
+# ==========================================
+if tela_atual == "Gestão de Utilizadores":
+    st.title("👥 Gestão de Utilizadores")
+    st.subheader("Utilizadores Ativos")
+    
+    for u in lista_usuarios_db:
+        status = "🟢 Ativo" if u.get('ativo', True) else "🔴 Inativo"
+        st.markdown(f"- {status} | **{u['name']}** (`{u['username']}`) | E-mail: {u['email']} | Perfil: {u['role']}")
+    st.divider()
+
+    tab_novo, tab_editar = st.tabs(["➕ Novo Acesso", "✏️ Editar / Excluir Utilizador"])
+    
+    with tab_novo:
+        with st.form("form_novo_usuario"):
+            col1, col2 = st.columns(2)
+            with col1:
+                novo_login = st.text_input("Login (ex: dr_joao)")
+                novo_nome = st.text_input("Nome Completo")
+            with col2:
+                novo_email = st.text_input("E-mail")
+                nova_senha = st.text_input("Palavra-passe Inicial", type="password")
+                
+            novo_perfil = st.selectbox("Perfil de Acesso", ["medico", "admin"])
+            btn_cadastrar = st.form_submit_button("Cadastrar Utilizador")
             
-        st.divider()
+            if btn_cadastrar:
+                if not novo_login or not nova_senha or not novo_nome:
+                    st.error("⚠️ Preencha os campos obrigatórios.")
+                else:
+                    try:
+                        hash_senha = bcrypt.hashpw(nova_senha.encode(), bcrypt.gensalt()).decode()
+                        conn = obter_conexao()
+                        cur = conn.cursor()
+                        cur.execute(
+                            "INSERT INTO usuarios (username, name, email, password, role, ativo) VALUES (%s, %s, %s, %s, %s, TRUE)",
+                            (novo_login, novo_nome, novo_email, hash_senha, novo_perfil)
+                        )
+                        cur.close()
+                        conn.close()
+                        
+                        carregar_usuarios_do_banco.clear() 
+                        st.success(f"✅ Utilizador {novo_nome} cadastrado com sucesso!")
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao cadastrar: {e}")
 
-        tab_novo, tab_editar = st.tabs(["➕ Novo Acesso", "✏️ Editar Usuário"])
+    with tab_editar:
+        lista_usernames = [u['username'] for u in lista_usuarios_db]
+        usuario_selecionado = st.selectbox("Selecione o utilizador que deseja alterar:", lista_usernames)
         
-        with tab_novo:
-            with st.form("form_novo_usuario"):
+        if usuario_selecionado:
+            dados_atuais = next(u for u in lista_usuarios_db if u['username'] == usuario_selecionado)
+            
+            with st.form("form_editar_usuario"):
                 col1, col2 = st.columns(2)
                 with col1:
-                    novo_login = st.text_input("Login do Sistema (ex: dr_joao)")
-                    novo_nome = st.text_input("Nome Completo")
+                    edit_login = st.text_input("Login (Username)", value=dados_atuais['username'])
+                    edit_nome = st.text_input("Nome Completo", value=dados_atuais['name'])
+                    edit_email = st.text_input("E-mail", value=dados_atuais['email'])
                 with col2:
-                    novo_email = st.text_input("E-mail")
-                    nova_senha = st.text_input("Senha Temporária", type="password")
-                    
-                novo_perfil = st.selectbox("Perfil de Acesso", ["medico", "admin"])
-                btn_cadastrar = st.form_submit_button("Cadastrar Usuário")
+                    edit_senha = st.text_input("Nova Palavra-passe (deixe em branco para manter)", type="password")
+                    edit_perfil = st.selectbox("Perfil de Acesso", ["medico", "admin"], index=0 if dados_atuais['role'] == "medico" else 1)
+                    edit_ativo = st.checkbox("🟢 Acesso Liberado (Desmarque para inativar o usuário)", value=dados_atuais.get('ativo', True))
                 
-                if btn_cadastrar:
-                    if not novo_login or not nova_senha or not novo_nome:
-                        st.error("⚠️ Preencha os campos obrigatórios (Login, Nome e Senha).")
-                    elif novo_login in config['credentials']['usernames']:
-                        st.error(f"⚠️ O login '{novo_login}' já existe no sistema.")
+                col_btn_salvar, col_btn_excluir = st.columns(2)
+                with col_btn_salvar:
+                    btn_salvar_edicao = st.form_submit_button("💾 Salvar Alterações", use_container_width=True)
+                with col_btn_excluir:
+                    btn_excluir_usuario = st.form_submit_button("🗑️ Excluir Utilizador", use_container_width=True)
+                
+                if btn_salvar_edicao:
+                    if not edit_nome or not edit_login:
+                        st.error("⚠️ O Nome e o Login são obrigatórios.")
                     else:
-                        hash_senha = bcrypt.hashpw(nova_senha.encode(), bcrypt.gensalt()).decode()
-                        config['credentials']['usernames'][novo_login] = {
-                            'email': novo_email,
-                            'failed_login_attempts': 0,
-                            'logged_in': False,
-                            'name': novo_nome,
-                            'password': hash_senha,
-                            'roles': [novo_perfil]
-                        }
-                        with open('config.yaml', 'w') as file:
-                            yaml.dump(config, file, default_flow_style=False)
-                        st.success(f"✅ Médico(a) {novo_nome} cadastrado com sucesso!")
-                        st.rerun() 
-                        
-        with tab_editar:
-            lista_usuarios = list(config['credentials']['usernames'].keys())
-            usuario_selecionado = st.selectbox("Selecione o usuário que deseja alterar:", lista_usuarios)
-            
-            if usuario_selecionado:
-                dados_atuais = config['credentials']['usernames'][usuario_selecionado]
-                
-                with st.form("form_editar_usuario"):
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        edit_login = st.text_input("Login (Usuário)", value=usuario_selecionado)
-                        edit_nome = st.text_input("Nome Completo", value=dados_atuais.get('name', ''))
-                    with col2:
-                        edit_email = st.text_input("E-mail", value=dados_atuais.get('email', ''))
-                        edit_senha = st.text_input("Nova Senha (deixe em branco para manter a atual)", type="password")
-                        
-                    perfil_atual = "admin" if "admin" in dados_atuais.get('roles', []) else "medico"
-                    edit_perfil = st.selectbox("Perfil de Acesso", ["medico", "admin"], index=0 if perfil_atual == "medico" else 1)
-                    
-                    btn_salvar_edicao = st.form_submit_button("Salvar Alterações")
-                    
-                    if btn_salvar_edicao:
-                        if not edit_login or not edit_nome:
-                            st.error("⚠️ Login e Nome são obrigatórios.")
-                        elif edit_login != usuario_selecionado and edit_login in config['credentials']['usernames']:
-                            st.error(f"⚠️ O login '{edit_login}' já está em uso por outra pessoa.")
-                        else:
-                            novos_dados = {
-                                'email': edit_email,
-                                'failed_login_attempts': dados_atuais.get('failed_login_attempts', 0),
-                                'logged_in': dados_atuais.get('logged_in', False),
-                                'name': edit_nome,
-                                'roles': [edit_perfil]
-                            }
+                        try:
+                            conn = obter_conexao()
+                            cur = conn.cursor()
+                            
+                            # Atualiza históricos primeiro se o login mudou
+                            if edit_login != usuario_selecionado:
+                                cur.execute("UPDATE historico_relatorios SET usuario=%s WHERE usuario=%s", (edit_login, usuario_selecionado))
+                                cur.execute("UPDATE logs_uso SET usuario=%s WHERE usuario=%s", (edit_login, usuario_selecionado))
                             
                             if edit_senha:
-                                novos_dados['password'] = bcrypt.hashpw(edit_senha.encode(), bcrypt.gensalt()).decode()
+                                hash_senha = bcrypt.hashpw(edit_senha.encode(), bcrypt.gensalt()).decode()
+                                cur.execute(
+                                    "UPDATE usuarios SET username=%s, name=%s, email=%s, role=%s, password=%s, ativo=%s WHERE username=%s",
+                                    (edit_login, edit_nome, edit_email, edit_perfil, hash_senha, edit_ativo, usuario_selecionado)
+                                )
                             else:
-                                novos_dados['password'] = dados_atuais['password']
-                                
-                            if edit_login != usuario_selecionado:
-                                del config['credentials']['usernames'][usuario_selecionado]
-                                
-                            config['credentials']['usernames'][edit_login] = novos_dados
+                                cur.execute(
+                                    "UPDATE usuarios SET username=%s, name=%s, email=%s, role=%s, ativo=%s WHERE username=%s",
+                                    (edit_login, edit_nome, edit_email, edit_perfil, edit_ativo, usuario_selecionado)
+                                )
+                            cur.close()
+                            conn.close()
                             
-                            with open('config.yaml', 'w') as file:
-                                yaml.dump(config, file, default_flow_style=False)
-                                
-                            st.success(f"✅ Usuário '{edit_nome}' atualizado com sucesso!")
+                            # Atualiza o sistema limpando os caches
+                            carregar_usuarios_do_banco.clear()
+                            carregar_historico_pessoal.clear()
+                            carregar_metricas.clear()
+                            
+                            st.success(f"✅ Utilizador '{edit_nome}' atualizado com sucesso!")
+                            time.sleep(1)
                             st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro ao atualizar: {e}")
 
-    elif tela_atual == "Sistema Médico":
-        
-        st.title(modo_medico) 
-        st.markdown("Grave a consulta em tempo real ou envie um arquivo de áudio para gerar o documento instantaneamente.")
-        st.divider()
-
-        # --- 🧠 GESTÃO DE ESTADO ---
-        if "relatorio_soap" not in st.session_state:
-            st.session_state.relatorio_soap = ""
-        if "ultimo_audio_id" not in st.session_state:
-            st.session_state.ultimo_audio_id = None
-
-        # --- FUNÇÃO CENTRALIZADA DE PROCESSAMENTO ---
-        def processar_audio_e_gerar_relatorio(caminho_arquivo, modo):
-            try:
-                with st.spinner("🧠 Transcrevendo..."):
-                    texto_transcrito = transcrever_audio(caminho_arquivo)
-                
-                if texto_transcrito.strip() and not texto_transcrito.startswith("⚠️"):
-                    with st.spinner(f"📝 Estruturando documento de {modo}..."):
-                        
-                        if modo == "Admissão":
-                            resultado = estruturar_consulta_soap(texto_transcrito)
-                        else:
-                            resultado = estruturar_evolucao(texto_transcrito)
+                if btn_excluir_usuario:
+                    if usuario_selecionado == username:
+                        st.error("⚠️ Não pode excluir o seu próprio utilizador enquanto estiver logado.")
+                    else:
+                        try:
+                            conn = obter_conexao()
+                            cur = conn.cursor()
+                            # Exclui todos os dados atrelados para não gerar erro no Banco de Dados
+                            cur.execute("DELETE FROM historico_relatorios WHERE usuario=%s", (usuario_selecionado,))
+                            cur.execute("DELETE FROM logs_uso WHERE usuario=%s", (usuario_selecionado,))
+                            cur.execute("DELETE FROM usuarios WHERE username=%s", (usuario_selecionado,))
+                            cur.close()
+                            conn.close()
                             
+                            # Atualiza o sistema limpando os caches
+                            carregar_usuarios_do_banco.clear()
+                            carregar_historico_pessoal.clear()
+                            carregar_metricas.clear()
+                            
+                            st.success(f"✅ Utilizador '{usuario_selecionado}' excluído permanentemente!")
+                            time.sleep(1)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro ao excluir: {e}")
+
+# ==========================================
+# TELA: SISTEMA MÉDICO (ADMISSÃO / EVOLUÇÃO)
+# ==========================================
+elif tela_atual == "Sistema Médico" and modo_medico in ["📋 Admissão", "📈 Evolução"]:
+    st.title(modo_medico) 
+    st.markdown("Grave a consulta ou envie um ficheiro de áudio.")
+    st.divider()
+
+    def processar_audio_e_gerar_relatorio(caminho_arquivo, modo, complementar=False):
+        from transcritor import transcrever_audio
+        from estruturador import estruturar_consulta_soap, estruturar_evolucao, complementar_documento
+        
+        sucesso = False
+        try:
+            with st.spinner("🧠 A transcrever..."):
+                texto_transcrito = transcrever_audio(caminho_arquivo)
+            
+            if texto_transcrito.strip() and not texto_transcrito.startswith("⚠️"):
+                acao_msg = "atualizar/complementar" if complementar else "estruturar"
+                with st.spinner(f"📝 A {acao_msg} o documento de {modo}..."):
+                    
+                    if complementar:
+                        resultado = complementar_documento(st.session_state.relatorio_soap, texto_transcrito, modo)
+                    else:
+                        resultado = estruturar_consulta_soap(texto_transcrito) if modo == "Admissão" else estruturar_evolucao(texto_transcrito)
+                    
+                    if "Erro na estruturação" in resultado:
+                        st.error(resultado)
+                    else:
                         st.session_state.relatorio_soap = resultado
-                    st.success(f"✨ {modo} gerada com sucesso!")
-                    registrar_log_uso(st.session_state["username"], modo)
-                else:
-                    st.error("Não foi possível extrair texto do áudio.")
-            except Exception as e:
-                st.error(f"Erro: {e}")
-            finally:
-                if os.path.exists(caminho_arquivo):
-                    os.remove(caminho_arquivo)
+                        st.session_state.chave_texto = str(uuid.uuid4())
+                        
+                        tipo_hist = f"{modo} (Complemento)" if complementar else modo
+                        salvar_historico_db(username, tipo_hist, resultado)
+                        
+                        st.success(f"✨ {modo} {'atualizada' if complementar else 'gerada'} com sucesso!")
+                        registrar_log_uso(username, modo)
+                        sucesso = True
+            else:
+                st.error("Não foi possível extrair texto ou áudio vazio.")
+        except Exception as e:
+            st.error(f"Erro inesperado no processamento: {e}")
+        finally:
+            if os.path.exists(caminho_arquivo):
+                os.remove(caminho_arquivo)
+        
+        if sucesso:
             st.rerun()
 
-        # 🗂️ Abas para Gravação ou Upload
-        sub_gravar, sub_upload = st.tabs(["🎙️ Gravar", "🗂️ Enviar Arquivo"])
+    sub_gravar, sub_upload = st.tabs(["🎙️ Gravar", "🗂️ Enviar Ficheiro"])
+    tipo_doc = "Admissão" if modo_medico == "📋 Admissão" else "Evolução"
+    
+    with sub_gravar:
+        audio_gravado = mic_recorder(
+            start_prompt="⏺️ Iniciar Gravação",
+            stop_prompt="⏹️ Encerrar e Gerar Documento",
+            just_once=False,
+            use_container_width=True,
+            key=f"gravador_{tipo_doc}" 
+        )
         
-        tipo_doc = "Admissão" if modo_medico == "📋 Admissão" else "Evolução"
+        if audio_gravado and audio_gravado['id'] != st.session_state.get("ultimo_audio_id"):
+            st.session_state.ultimo_audio_id = audio_gravado['id']
+            caminho_temp = f"temp_gravacao_{username}_{uuid.uuid4().hex}.webm"
+            with open(caminho_temp, "wb") as f:
+                f.write(audio_gravado['bytes'])
+            processar_audio_e_gerar_relatorio(caminho_temp, tipo_doc, complementar=False)
+
+    with sub_upload:
+        arquivo_audio = st.file_uploader("Anexe o áudio inicial", type=["webm", "mp3", "wav", "m4a", "ogg"], key=f"upload_{tipo_doc}")
+        if arquivo_audio is not None and st.button("🚀 Analisar Áudio", key=f"btn_analisar_{tipo_doc}"):
+            caminho_temp = f"temp_upload_{username}_{uuid.uuid4().hex}.webm"
+            with open(caminho_temp, "wb") as f:
+                f.write(arquivo_audio.getbuffer())
+            processar_audio_e_gerar_relatorio(caminho_temp, tipo_doc, complementar=False)
+
+    # ==========================================
+    # ZONA DO RELATÓRIO FINAL
+    # ==========================================
+    if st.session_state.relatorio_soap:
+        st.divider()
+        st.subheader("📋 Documento Final")
         
-        with sub_gravar:
-            audio_gravado = mic_recorder(
-                start_prompt="⏺️ Iniciar Gravação",
-                stop_prompt="⏹️ Encerrar e Gerar Documento",
-                just_once=False,
-                use_container_width=True,
-                key=f"gravador_{tipo_doc}" 
-            )
-            
-            if audio_gravado and audio_gravado['id'] != st.session_state.get("ultimo_audio_id"):
-                st.session_state.ultimo_audio_id = audio_gravado['id']
-                caminho_temp = f"temp_gravacao.webm"
-                with open(caminho_temp, "wb") as f:
-                    f.write(audio_gravado['bytes'])
-                processar_audio_e_gerar_relatorio(caminho_temp, tipo_doc)
+        def atualizar_texto_editavel():
+            st.session_state.relatorio_soap = st.session_state[st.session_state.chave_texto]
 
-        with sub_upload:
-            arquivo_audio = st.file_uploader("Anexe o áudio", type=["webm", "mp3", "wav", "m4a", "ogg"], key=f"upload_{tipo_doc}")
-            if arquivo_audio is not None and st.button("🚀 Analisar Áudio", key=f"btn_analisar_{tipo_doc}"):
-                caminho_temp = f"temp_upload.webm"
-                with open(caminho_temp, "wb") as f:
-                    f.write(arquivo_audio.getbuffer())
-                processar_audio_e_gerar_relatorio(caminho_temp, tipo_doc)
+        st.text_area(
+            "Resultado (Editável):", 
+            value=st.session_state.relatorio_soap, 
+            key=st.session_state.chave_texto,      
+            height=450,
+            on_change=atualizar_texto_editavel
+        )
+        
+        st.write("") 
 
-        # 📋 ZONA DE EXIBIÇÃO E ENVIO DE E-MAIL
-        if st.session_state.relatorio_soap:
-            st.divider()
-            st.subheader("📋 Documento Clínico Final")
-            st.text_area("Resultado:", st.session_state.relatorio_soap, height=450)
-            
-            st.divider()
-
-            username_logado = st.session_state.get("username")
-            email_usuario = config['credentials']['usernames'].get(username_logado, {}).get('email')
-
+        col_email, col_comp = st.columns(2)
+        
+        with col_email:
             if email_usuario:
-                if st.button("📧 Receber relatório por e-mail"):
+                if st.button("📧 Receber por e-mail", use_container_width=True):
                     try:
                         remetente = st.secrets["EMAIL_USER"]
-                        senha_app = st.secrets["EMAIL_PASSWORD"]
-                        
                         msg = MIMEMultipart()
                         msg['From'] = remetente
                         msg['To'] = email_usuario
@@ -284,36 +441,78 @@ elif st.session_state["authentication_status"]:
                         
                         server = smtplib.SMTP('smtp.mail.yahoo.com', 587)
                         server.starttls()
-                        server.login(remetente, senha_app)
+                        server.login(remetente, st.secrets["EMAIL_PASSWORD"])
                         server.send_message(msg)
                         server.quit()
-                        
                         st.success(f"✅ Enviado para {email_usuario}!")
                     except Exception as e:
                         st.error(f"Erro ao enviar: {e}")
             else:
-                st.warning("⚠️ E-mail não encontrado no cadastro. Verifique seu config.yaml.")
+                st.warning("⚠️ E-mail não cadastrado.")
 
-    elif tela_atual == "📊 Métricas":
-        st.title("📊 Métricas de Uso")
-        
-        if not os.path.exists('logs_uso.csv'):
-            st.info("Nenhum dado de uso registrado ainda. Gere um relatório para começar.")
-        else:
-            # Importa o pandas apenas aqui para garantir que ele está disponível
-            import pandas as pd 
+        with col_comp:
+            audio_comp = mic_recorder(
+                start_prompt="🎙️ Gravar Complemento (Áudio)",
+                stop_prompt="⏹️ Encerrar e Atualizar",
+                just_once=False,
+                use_container_width=True,
+                key=f"comp_gravador_{tipo_doc}" 
+            )
             
-            # Lê o arquivo
-            df = pd.read_csv('logs_uso.csv', names=['Data', 'Usuario', 'Tipo'])
+            if audio_comp and audio_comp['id'] != st.session_state.ultimo_comp_id:
+                st.session_state.ultimo_comp_id = audio_comp['id']
+                caminho_temp = f"temp_comp_grav_{username}_{uuid.uuid4().hex}.webm"
+                with open(caminho_temp, "wb") as f:
+                    f.write(audio_comp['bytes'])
+                processar_audio_e_gerar_relatorio(caminho_temp, tipo_doc, complementar=True)
+
+# ==========================================
+# TELA: HISTÓRICO DA SESSÃO
+# ==========================================
+elif tela_atual == "Sistema Médico" and modo_medico == "📂 Histórico":
+    st.title("📂 Histórico de Relatórios")
+    st.markdown("Veja todos os prontuários e evoluções gerados por si. Estes dados estão guardados permanentemente na sua conta.")
+    st.divider()
+    
+    def carregar_para_edicao(conteudo_salvo, tipo_salvo):
+        tipo_base = "📋 Admissão" if "Admissão" in tipo_salvo else "📈 Evolução"
+        st.session_state.radio_acao = tipo_base
+        st.session_state.relatorio_soap = conteudo_salvo
+        st.session_state.chave_texto = str(uuid.uuid4())
+    
+    # ⚡ Esta linha agora roda de forma instantânea graças ao Cache de Dados!
+    historico_db = carregar_historico_pessoal(username)
+    
+    if not historico_db:
+        st.info("Nenhum relatório foi gerado por si ainda.")
+    else:
+        for idx, item in enumerate(historico_db):
+            data_formatada = item['data'].strftime("%d/%m/%Y %H:%M") if hasattr(item['data'], 'strftime') else item['data']
             
-            if df.empty:
-                st.info("Arquivo de log vazio.")
-            else:
-                # Agrupa os dados
-                metricas = df.groupby(['Usuario', 'Tipo']).size().unstack(fill_value=0)
+            with st.expander(f"{item['tipo']} - Gerado em: {data_formatada}", expanded=(idx==0)):
+                st.text_area("Conteúdo:", item['conteudo'], height=250, key=f"hist_db_{idx}", disabled=True)
                 
-                st.subheader("Relatórios Gerados por Médico")
-                st.dataframe(metricas, use_container_width=True)
-                
-                st.subheader("Resumo Visual")
-                st.bar_chart(metricas)
+                st.button(
+                    "✏️ Carregar para Edição / Complementar", 
+                    key=f"btn_load_{idx}", 
+                    use_container_width=True,
+                    on_click=carregar_para_edicao,     
+                    args=(item['conteudo'], item['tipo']) 
+                )
+
+# ==========================================
+# TELA: MÉTRICAS
+# ==========================================
+elif tela_atual == "Métricas":
+    st.title("Métricas de Uso")
+    
+    # ⚡ Esta linha agora roda de forma instantânea graças ao Cache de Dados!
+    registros = carregar_metricas()
+    
+    if not registros:
+        st.info("Nenhum registo ainda.")
+    else:
+        df = pd.DataFrame(registros)
+        metricas = df.groupby(['usuario', 'tipo']).size().unstack(fill_value=0)
+        st.dataframe(metricas, use_container_width=True)
+        st.bar_chart(metricas)
