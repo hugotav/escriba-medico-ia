@@ -18,11 +18,33 @@ import time
 # ==========================================
 st.set_page_config(page_title="VoxReport IA", page_icon="📋", layout="centered")
 
+# 💡 CORREÇÃO VISUAL: Evita que o botão de áudio fique cortado na parte inferior
+st.markdown("""
+<style>
+    iframe[title*="mic_recorder"] {
+        min-height: 52px !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 def obter_conexao():
     # Abre uma conexão super rápida. Autocommit evita locks no banco de dados.
     conn = psycopg2.connect(st.secrets["DB_URI"])
     conn.autocommit = True
     return conn
+
+# 💡 AUTO-REPARAÇÃO: Cria a coluna 'ativo' automaticamente no seu banco de dados se ela não existir
+def auto_corrigir_banco():
+    try:
+        conn = obter_conexao()
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ativo BOOLEAN DEFAULT TRUE;")
+        cur.close()
+        conn.close()
+    except Exception:
+        pass # Se falhar, o erro real será capturado na função principal abaixo
+
+auto_corrigir_banco()
 
 # ==========================================
 # 🚀 FUNÇÕES DE BANCO DE DADOS (COM CACHE ULTRA-RÁPIDO)
@@ -34,13 +56,12 @@ def carregar_usuarios_do_banco():
     try:
         conn = obter_conexao()
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        # Traz os usuários e assume que quem não tem a coluna "ativo" é porque está ativo
         cur.execute("SELECT username, name, email, password, role, COALESCE(ativo, TRUE) as ativo FROM usuarios")
         usuarios_db = cur.fetchall()
         
         credentials = {"usernames": {}}
         for u in usuarios_db:
-            if u['ativo']: # Só carrega para o login se estiver ativo
+            if u.get('ativo', True): # Só carrega para o login se estiver ativo
                 credentials["usernames"][u['username']] = {
                     "name": u['name'],
                     "password": u['password'],
@@ -49,7 +70,8 @@ def carregar_usuarios_do_banco():
                 }
         return credentials, usuarios_db
     except Exception as e:
-        return None, None
+        # 💡 AGORA ELE MOSTRA O ERRO EXATO EM VEZ DE ENTRAR EM LOOP
+        return None, str(e)
     finally:
         if cur: cur.close()
         if conn: conn.close()
@@ -93,7 +115,7 @@ def registrar_log_uso(usuario, tipo):
         cur.execute("INSERT INTO logs_uso (usuario, tipo) VALUES (%s, %s)", (usuario, tipo))
         cur.close()
         conn.close()
-        carregar_metricas.clear() # 💡 Limpa o cache para a aba de métricas atualizar na hora
+        carregar_metricas.clear() # Limpa o cache para a aba de métricas atualizar na hora
     except Exception:
         pass 
 
@@ -107,7 +129,7 @@ def salvar_historico_db(usuario, tipo, conteudo):
         )
         cur.close()
         conn.close()
-        carregar_historico_pessoal.clear() # 💡 Limpa o cache para o histórico atualizar na hora
+        carregar_historico_pessoal.clear() # Limpa o cache para o histórico atualizar na hora
     except Exception as e:
         st.error(f"⚠️ Erro ao guardar no histórico permanente: {e}")
 
@@ -116,10 +138,10 @@ def salvar_historico_db(usuario, tipo, conteudo):
 # ==========================================
 dados_banco = carregar_usuarios_do_banco()
 
+# Se o banco falhar, o erro exato aparecerá aqui na sua tela
 if dados_banco[0] is None:
-    st.warning("⚠️ Instabilidade temporária com a base de dados. A reconectar...")
-    time.sleep(2)
-    st.rerun()
+    st.error(f"🚨 ERRO CRÍTICO NO BANCO DE DADOS: {dados_banco[1]}")
+    st.stop()
 
 credentials, lista_usuarios_db = dados_banco
 
@@ -275,7 +297,6 @@ if tela_atual == "Gestão de Utilizadores":
                             conn = obter_conexao()
                             cur = conn.cursor()
                             
-                            # Atualiza históricos primeiro se o login mudou
                             if edit_login != usuario_selecionado:
                                 cur.execute("UPDATE historico_relatorios SET usuario=%s WHERE usuario=%s", (edit_login, usuario_selecionado))
                                 cur.execute("UPDATE logs_uso SET usuario=%s WHERE usuario=%s", (edit_login, usuario_selecionado))
@@ -294,7 +315,6 @@ if tela_atual == "Gestão de Utilizadores":
                             cur.close()
                             conn.close()
                             
-                            # Atualiza o sistema limpando os caches
                             carregar_usuarios_do_banco.clear()
                             carregar_historico_pessoal.clear()
                             carregar_metricas.clear()
@@ -312,14 +332,12 @@ if tela_atual == "Gestão de Utilizadores":
                         try:
                             conn = obter_conexao()
                             cur = conn.cursor()
-                            # Exclui todos os dados atrelados para não gerar erro no Banco de Dados
                             cur.execute("DELETE FROM historico_relatorios WHERE usuario=%s", (usuario_selecionado,))
                             cur.execute("DELETE FROM logs_uso WHERE usuario=%s", (usuario_selecionado,))
                             cur.execute("DELETE FROM usuarios WHERE username=%s", (usuario_selecionado,))
                             cur.close()
                             conn.close()
                             
-                            # Atualiza o sistema limpando os caches
                             carregar_usuarios_do_banco.clear()
                             carregar_historico_pessoal.clear()
                             carregar_metricas.clear()
@@ -480,7 +498,6 @@ elif tela_atual == "Sistema Médico" and modo_medico == "📂 Histórico":
         st.session_state.relatorio_soap = conteudo_salvo
         st.session_state.chave_texto = str(uuid.uuid4())
     
-    # ⚡ Esta linha agora roda de forma instantânea graças ao Cache de Dados!
     historico_db = carregar_historico_pessoal(username)
     
     if not historico_db:
@@ -506,7 +523,6 @@ elif tela_atual == "Sistema Médico" and modo_medico == "📂 Histórico":
 elif tela_atual == "Métricas":
     st.title("Métricas de Uso")
     
-    # ⚡ Esta linha agora roda de forma instantânea graças ao Cache de Dados!
     registros = carregar_metricas()
     
     if not registros:
