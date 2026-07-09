@@ -4,3 +4,4 @@ streamlit-authenticator
 streamlit-mic-recorder
 psycopg2-binary
 pandas
+groq
